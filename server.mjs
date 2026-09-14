@@ -1,147 +1,114 @@
 /**
- * Custom Next.js server with a built-in WebSocket hub.
+ * Single-process server for Render's free tier:
+ *   • Next.js app (UI + /api/health)
+ *   • REST API   -> /api/rooms...
+ *   • WebSockets -> wss://<host>/  |  /ws  |  /ws/<CODE>  |  /chat
  *
- * Render's free tier gives you exactly one port, so HTTP and WebSocket share
- * it: https://<name>.onrender.com for the REST API / UI and
- * wss://<name>.onrender.com (or /ws) for the realtime chat socket.
+ * Render only exposes ONE port per web service, so HTTP and WS share it.
  */
 import { createServer } from "node:http";
-import { config as loadEnv } from "dotenv";
 import next from "next";
-import pg from "pg";
-
-import { createChatHub } from "./server/chat-hub.mjs";
-import { ensureSchema } from "./server/ensure-schema.mjs";
-
-loadEnv({ quiet: true });
-
-const { Pool } = pg;
+import { handleApi } from "./server/api.mjs";
+import { Hub } from "./server/hub.mjs";
+import { createStore } from "./server/store.mjs";
+import { attachWebsocketServer, isWebsocketPath } from "./server/ws.mjs";
 
 const dev = process.env.NODE_ENV !== "production";
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 const hostname = process.env.HOST ?? "0.0.0.0";
-const databaseUrl = process.env.DATABASE_URL;
 
-if (!databaseUrl) {
-  console.error("[boot] DATABASE_URL is required");
-  process.exit(1);
+// Next.js loads .env files for its own runtime; do the same for the custom
+// server so DATABASE_URL is available before the store is created.
+async function loadEnvFiles() {
+  try {
+    const mod = await import("@next/env");
+    const loadEnvConfig = mod.loadEnvConfig ?? mod.default?.loadEnvConfig;
+    if (typeof loadEnvConfig === "function") {
+      loadEnvConfig(process.cwd(), dev);
+      return;
+    }
+  } catch {
+    /* fall through to dotenv */
+  }
+  try {
+    const mod = await import("dotenv");
+    const dotenv = mod.default ?? mod;
+    dotenv.config({ path: [".env.local", ".env"], quiet: true });
+  } catch {
+    /* env files are optional */
+  }
 }
 
-const needsSsl =
-  /\bsslmode=require\b/.test(databaseUrl) ||
-  (process.env.PGSSLMODE === "require") ||
-  (process.env.DATABASE_SSL === "true");
-
-const pool = new Pool({
-  connectionString: databaseUrl,
-  max: Number.parseInt(process.env.PGPOOL_MAX ?? "8", 10),
-  ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
-});
-
-pool.on("error", (error) => console.error("[db] pool error:", error.message));
+await loadEnvFiles();
 
 const app = next({ dev, hostname, port });
-const handle = app.getRequestHandler();
-/** @type {((req: any, socket: any, head: any) => void) | null} */
-let nextUpgrade = null;
 
 async function main() {
-  try {
-    await ensureSchema(pool);
-  } catch (error) {
-    console.error("[db] schema bootstrap failed:", error.message);
-  }
+  const store = await createStore();
+  const hub = new Hub(store);
 
   await app.prepare();
 
-  if (typeof app.getUpgradeHandler === "function") {
-    try {
-      nextUpgrade = app.getUpgradeHandler();
-    } catch {
-      nextUpgrade = null;
-    }
-  }
-
-  const hub = createChatHub({ pool, databaseUrl });
-  globalThis.__chatHub = hub;
+  // These must be created *after* prepare() resolves.
+  const handleNext = app.getRequestHandler();
+  const handleNextUpgrade =
+    typeof app.getUpgradeHandler === "function" ? app.getUpgradeHandler() : null;
 
   const server = createServer((req, res) => {
-    if (req.url === "/ws" || req.url?.startsWith("/ws?")) {
-      // Plain HTTP hit on the socket endpoint: explain how to use it.
-      res.writeHead(426, { "Content-Type": "application/json", Upgrade: "websocket" });
-      res.end(
-        JSON.stringify({
-          ok: false,
-          error: {
-            code: "UPGRADE_REQUIRED",
-            message: "connect with a WebSocket client: wss://<host>/ws?room=CODE&username=YOU",
-          },
-        }),
-      );
-      return;
-    }
-    handle(req, res).catch((error) => {
-      console.error("[http] handler error:", error);
-      res.statusCode = 500;
-      res.end("internal server error");
-    });
+    handleApi(req, res, hub)
+      .then((handled) => {
+        if (!handled) return handleNext(req, res);
+        return undefined;
+      })
+      .catch((error) => {
+        console.error("[http] unhandled error:", error);
+        if (!res.headersSent) {
+          res.writeHead(500, { "content-type": "application/json" });
+        }
+        res.end(JSON.stringify({ ok: false, error: { code: "INTERNAL_ERROR", message: "Server error" } }));
+      });
   });
 
+  // keep free-tier proxies from cutting idle websocket connections too early
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
+
+  const ws = attachWebsocketServer(server, hub);
+
+  // Everything that is not a chat socket (e.g. Next.js HMR in dev) goes to Next.
   server.on("upgrade", (req, socket, head) => {
     let pathname = "/";
     try {
       pathname = new URL(req.url ?? "/", "http://localhost").pathname;
     } catch {
+      /* ignore */
+    }
+    if (isWebsocketPath(pathname)) return;
+    if (handleNextUpgrade) {
+      void handleNextUpgrade(req, socket, head);
+    } else {
       socket.destroy();
-      return;
     }
-
-    if (pathname.startsWith("/_next")) {
-      if (nextUpgrade) {
-        nextUpgrade(req, socket, head);
-      } else {
-        socket.destroy();
-      }
-      return;
-    }
-
-    const match = hub.matchUpgrade(pathname);
-    if (match.matched) {
-      hub.handleUpgrade(req, socket, head, match);
-      return;
-    }
-
-    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-    socket.destroy();
   });
-
-  server.keepAliveTimeout = 120_000;
-  server.headersTimeout = 125_000;
 
   server.listen(port, hostname, () => {
-    console.log(`▲ chat server ready on http://${hostname}:${port} (dev=${dev})`);
-    console.log(`   websocket endpoints: /  /ws  /ws/:code  /api/rooms/:code/ws`);
+    console.log(`▶ chat server ready on http://${hostname}:${port}`);
+    console.log(`  websocket  ws://${hostname}:${port}/ws?room=CODE&username=NAME`);
+    console.log(`  rest api   POST http://${hostname}:${port}/api/rooms`);
+    console.log(`  storage    ${store.kind}`);
   });
 
-  const shutdown = async (signal) => {
-    console.log(`[boot] ${signal} received, shutting down`);
-    const timer = setTimeout(() => process.exit(0), 8000);
-    try {
-      await hub.close();
-      await new Promise((resolve) => server.close(resolve));
-      await pool.end();
-    } catch (error) {
-      console.error("[boot] shutdown error:", error?.message);
-    }
-    clearTimeout(timer);
-    process.exit(0);
+  const shutdown = (signal) => {
+    console.log(`\n[server] ${signal} received, shutting down…`);
+    ws.stop();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5_000).unref();
   };
-
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 main().catch((error) => {
-  console.error("[boot] fatal:", error);
+  console.error("[server] failed to start:", error);
   process.exit(1);
 });
