@@ -1,40 +1,21 @@
-import { sql } from "drizzle-orm";
-
-import { db } from "@/db";
-import { json, publicUrls } from "@/lib/http";
-
 export const dynamic = "force-dynamic";
 
-type HubSnapshot = {
-  hubId: string;
-  rooms: number;
-  sockets: number;
-  connections: number;
-  messages: number;
-  startedAt: string;
-};
-
-export async function GET(request: Request) {
-  const hub = (
-    globalThis as typeof globalThis & { __chatHub?: { snapshot: () => HubSnapshot } }
-  ).__chatHub;
-
+/**
+ * Health check used by Render (`healthCheckPath: /api/health`).
+ *
+ * The chat server works with or without Postgres, so a missing/unreachable
+ * database reports `storage: "memory"`/`"degraded"` instead of failing the
+ * deploy — the websocket gateway is still fully functional.
+ */
+export async function GET() {
+  if (!process.env.DATABASE_URL) {
+    return Response.json({ ok: true, storage: "memory", ts: new Date().toISOString() });
+  }
   try {
+    const [{ db }, { sql }] = await Promise.all([import("@/db"), import("drizzle-orm")]);
     await db.execute(sql`select 1`);
-    const urls = publicUrls(request);
-    return json({
-      ok: true,
-      service: "render-chat",
-      database: "up",
-      websocket: hub
-        ? { enabled: true, url: `${urls.ws}/ws`, ...hub.snapshot() }
-        : { enabled: false, reason: "custom server not active (HTTP fallback only)" },
-      time: new Date().toISOString(),
-    });
-  } catch (error) {
-    return json(
-      { ok: false, database: "down", message: (error as Error).message },
-      { status: 500 },
-    );
+    return Response.json({ ok: true, storage: "postgres", ts: new Date().toISOString() });
+  } catch {
+    return Response.json({ ok: true, storage: "degraded", ts: new Date().toISOString() });
   }
 }
