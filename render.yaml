@@ -1,27 +1,28 @@
-# Render Blueprint — free web service + free Postgres.
-# Dashboard → New → Blueprint → pick this repo → Apply.
 services:
   - type: web
-    name: render-chat
+    name: renderchat
     runtime: node
     plan: free
-    region: oregon
+    # --- Render web service commands -------------------------------------
     buildCommand: npm install && npm run build
-    # npm start boots server.mjs: Next.js + the WebSocket hub on the same $PORT,
-    # which is what makes wss://<name>.onrender.com work on the free tier.
-    startCommand: npm start
+    startCommand: npm run start
+    # ---------------------------------------------------------------------
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATABASE_URL
-        fromDatabase:
-          name: render-chat-db
-          property: connectionString
+      - key: NODE_VERSION
+        value: "22"
+      # Optional: attach a Postgres instance for persistent history.
+      # Without DATABASE_URL the server uses its in-memory store.
+      # - key: DATABASE_URL
+      #   fromDatabase:
+      #     name: renderchat-db
+      #     property: connectionString
 
-databases:
-  - name: render-chat-db
-    plan: free
-    databaseName: renderchat
-    user: renderchat
+# databases:
+#   - name: renderchat-db
+#     plan: free
+#     databaseName: renderchat
+#     user: renderchat
